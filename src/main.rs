@@ -40,8 +40,8 @@ async fn db_initialize(tx: &mut MySqlConnection) -> Result<()> {
 }
 
 async fn get_initialize(State(AppState { pool, .. }): State<AppState>) -> Result<()> {
-    let mut tx = pool.begin().await?;
-    db_initialize(&mut tx).await?;
+    let mut conn = pool.acquire().await?;
+    db_initialize(&mut conn).await?;
 
     Ok(())
 }
