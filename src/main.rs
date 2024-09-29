@@ -1,19 +1,30 @@
-use std::env;
-
-use axum::{extract::State, http::StatusCode, Router};
+use axum::{
+    extract::State,
+    http::{HeaderValue, StatusCode},
+    response::{Html, IntoResponse, Response},
+    Router,
+};
+use serde::Serialize;
 use sqlx::MySqlConnection;
+use std::env;
+use tower_http::services::ServeDir;
+use tower_sessions::{MemoryStore, Session, SessionManagerLayer};
 use tracing::error;
 
 #[derive(Debug, thiserror::Error)]
 enum Error {
     #[error("SQLx error: {0}")]
     Sqlx(#[from] sqlx::Error),
+    #[error("Session error: {0}")]
+    Session(#[from] tower_sessions::session::Error),
+    #[error("Template error: {0}")]
+    Template(#[from] minijinja::Error),
 }
 
 impl axum::response::IntoResponse for Error {
     fn into_response(self) -> axum::response::Response {
         let status = match self {
-            Error::Sqlx(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
         error!("{}", self);
@@ -22,6 +33,65 @@ impl axum::response::IntoResponse for Error {
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+// axum::response::Redirect doesn't support 302 status code.
+struct Redirect(HeaderValue);
+impl Redirect {
+    fn new(uri: &str) -> Self {
+        Self(HeaderValue::from_str(uri).expect("Failed to create a HeaderValue from a string."))
+    }
+}
+impl IntoResponse for Redirect {
+    fn into_response(self) -> Response {
+        (StatusCode::FOUND, [("location", self.0)]).into_response()
+    }
+}
+
+fn render_template<S: Serialize>(tmpl_name: &str, context: S) -> Result<Html<String>> {
+    let mut env = minijinja::Environment::new();
+    env.set_loader(minijinja::path_loader("templates"));
+    let tmpl = env.get_template(tmpl_name)?;
+    Ok(Html(tmpl.render(context)?))
+}
+
+#[derive(sqlx::FromRow, Serialize)]
+struct User {
+    id: i64,
+    account_name: String,
+    passhash: String,
+    authority: i64,
+    del_flg: i64,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn is_login(user: &Option<User>) -> bool {
+    user.is_some()
+}
+
+async fn get_session_user(session: &Session, tx: &mut MySqlConnection) -> Result<Option<User>> {
+    let uid = session.get::<i64>("user_id").await?;
+
+    if let Some(uid) = uid {
+        let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
+            .bind(uid)
+            .fetch_one(&mut *tx)
+            .await?;
+
+        Ok(Some(user))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn get_flush(session: &Session, key: &str) -> Result<String> {
+    Ok(match session.get(key).await? {
+        Some(value) => {
+            session.remove::<String>(key).await?;
+            value
+        }
+        None => "".to_string(),
+    })
+}
 
 async fn db_initialize(tx: &mut MySqlConnection) -> Result<()> {
     let sqls = [
@@ -44,6 +114,23 @@ async fn get_initialize(State(AppState { pool, .. }): State<AppState>) -> Result
     db_initialize(&mut conn).await?;
 
     Ok(())
+}
+
+async fn get_login(
+    session: Session,
+    State(AppState { pool, .. }): State<AppState>,
+) -> Result<Response> {
+    let mut conn = pool.acquire().await?;
+    let me = get_session_user(&session, &mut conn).await?;
+    if is_login(&me) {
+        return Ok(Redirect::new("/").into_response());
+    }
+
+    Ok(render_template(
+        "login.html",
+        minijinja::context!(me, flush => get_flush(&session, "notice").await?),
+    )?
+    .into_response())
 }
 
 fn build_mysql_options() -> sqlx::mysql::MySqlConnectOptions {
@@ -95,10 +182,18 @@ async fn main() {
         .await
         .expect("failed to connect db");
 
+    let session_store = MemoryStore::default();
+    let session_layer = SessionManagerLayer::new(session_store);
+
+    let serve_dir = ServeDir::new("public");
+
     let app = Router::new()
         .route("/initialize", axum::routing::get(get_initialize))
+        .route("/login", axum::routing::get(get_login))
         .with_state(AppState { pool })
-        .layer(tower_http::trace::TraceLayer::new_for_http());
+        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .layer(session_layer)
+        .fallback_service(serve_dir);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     axum::serve(listener, app).await.unwrap();

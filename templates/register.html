@@ -4,10 +4,9 @@
   <h1>ユーザー登録</h1>
 </div>
 
-{% set notice = get_flashed_messages() %}
-{% if notice %}
+{% if flash %}
 <div id="notice-message" class="alert alert-danger">
-    {{ '\n'.join(notice) }}
+  {{ flash }}
 </div>
 {% endif %}
 

@@ -12,10 +12,9 @@
       <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
       <input type="submit" name="submit" value="submit">
     </div>
-    {% set notice = '\n'.join(get_flashed_messages()) %}
-    {% if notice %}
+    {% if flash %}
     <div id="notice-message" class="alert alert-danger">
-      {{ notice }}
+      {{ flash }}
     </div>
     {% endif %}
   </form>
