@@ -2,37 +2,47 @@ use axum::{
     extract::State,
     http::{HeaderValue, StatusCode},
     response::{Html, IntoResponse, Response},
-    Router,
+    Form, Router,
 };
+use rand::prelude::*;
 use serde::Serialize;
+use shell_quote::Sh;
 use sqlx::MySqlConnection;
-use std::env;
+use std::{collections::HashMap, env, process::Command};
 use tower_http::services::ServeDir;
 use tower_sessions::{MemoryStore, Session, SessionManagerLayer};
 use tracing::error;
 
-#[derive(Debug, thiserror::Error)]
-enum Error {
-    #[error("SQLx error: {0}")]
-    Sqlx(#[from] sqlx::Error),
-    #[error("Session error: {0}")]
-    Session(#[from] tower_sessions::session::Error),
-    #[error("Template error: {0}")]
-    Template(#[from] minijinja::Error),
-}
-
-impl axum::response::IntoResponse for Error {
-    fn into_response(self) -> axum::response::Response {
-        let status = match self {
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-
-        error!("{}", self);
-        (status, format!("{}", self)).into_response()
+#[derive(thiserror::Error, Debug)]
+enum CustomError {}
+impl axum::response::IntoResponse for CustomError {
+    fn into_response(self) -> Response {
+        match self {}
     }
 }
 
-type Result<T, E = Error> = std::result::Result<T, E>;
+impl axum::response::IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        match self.0.downcast::<CustomError>() {
+            Ok(e) => e.into_response(),
+            Err(e) => {
+                error!("{} {}", e, e.backtrace());
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)).into_response()
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AppError(anyhow::Error);
+
+impl<E: Into<anyhow::Error>> From<E> for AppError {
+    fn from(e: E) -> Self {
+        Self(e.into())
+    }
+}
+
+type Result<T, E = AppError> = std::result::Result<T, E>;
 
 // axum::response::Redirect doesn't support 302 status code.
 struct Redirect(HeaderValue);
@@ -83,7 +93,63 @@ async fn get_session_user(session: &Session, tx: &mut MySqlConnection) -> Result
     }
 }
 
-async fn get_flush(session: &Session, key: &str) -> Result<String> {
+async fn try_login(
+    account_name: &str,
+    password: &str,
+    tx: &mut MySqlConnection,
+) -> Result<Option<User>> {
+    let user = match sqlx::query_as::<_, User>(
+        "SELECT * FROM users WHERE account_name = ? AND del_flg = 0",
+    )
+    .bind(account_name)
+    .fetch_optional(&mut *tx)
+    .await?
+    {
+        Some(user) => user,
+        None => return Ok(None),
+    };
+
+    Ok(
+        if calculate_passhash(&user.account_name, password) == user.passhash {
+            Some(user)
+        } else {
+            None
+        },
+    )
+}
+
+fn secure_random_str(b: usize) -> String {
+    let mut bytes = vec![0; b];
+    thread_rng().fill_bytes(&mut bytes);
+    bytes
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn digest(src: &str) -> String {
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "echo -n {} | openssl dgst -sha512 | sed 's/^.*= //'",
+            String::from_utf8(Sh::quote_vec(src)).unwrap()
+        ))
+        .output()
+        .expect("Failed to execute openssl")
+        .stdout;
+    String::from_utf8(output).unwrap().trim_end().to_string()
+}
+
+fn calculate_salt(account_name: &str) -> String {
+    digest(account_name)
+}
+
+fn calculate_passhash(account_name: &str, password: &str) -> String {
+    digest(&(password.to_string() + ":" + &calculate_salt(account_name)))
+}
+
+async fn get_flash(session: &Session, key: &str) -> Result<String> {
     Ok(match session.get(key).await? {
         Some(value) => {
             session.remove::<String>(key).await?;
@@ -128,9 +194,37 @@ async fn get_login(
 
     Ok(render_template(
         "login.html",
-        minijinja::context!(me, flush => get_flush(&session, "notice").await?),
+        minijinja::context!(me, flash => get_flash(&session, "notice").await?),
     )?
     .into_response())
+}
+
+async fn post_login(
+    session: Session,
+    State(AppState { pool, .. }): State<AppState>,
+    Form(form): Form<HashMap<String, String>>,
+) -> Result<Response> {
+    let mut conn = pool.acquire().await?;
+    if is_login(&get_session_user(&session, &mut conn).await?) {
+        return Ok(Redirect::new("/").into_response());
+    }
+    let user = try_login(
+        form["account_name"].as_str(),
+        form["password"].as_str(),
+        &mut conn,
+    )
+    .await?;
+
+    if let Some(user) = user {
+        session.insert("user_id", user.id).await?;
+        session.insert("csrf_token", secure_random_str(16)).await?;
+        Ok(Redirect::new("/").into_response())
+    } else {
+        session
+            .insert("notice", "アカウント名かパスワードが間違っています")
+            .await?;
+        Ok(Redirect::new("/login").into_response())
+    }
 }
 
 fn build_mysql_options() -> sqlx::mysql::MySqlConnectOptions {
@@ -190,6 +284,7 @@ async fn main() {
     let app = Router::new()
         .route("/initialize", axum::routing::get(get_initialize))
         .route("/login", axum::routing::get(get_login))
+        .route("/login", axum::routing::post(post_login))
         .with_state(AppState { pool })
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(session_layer)
