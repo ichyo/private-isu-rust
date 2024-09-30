@@ -11,7 +11,7 @@ use shell_quote::Sh;
 use sqlx::MySqlConnection;
 use std::{collections::HashMap, env, process::Command};
 use tower_http::services::ServeDir;
-use tower_sessions::{MemoryStore, Session, SessionManagerLayer};
+use tower_sessions::{cookie::time::Duration, Expiry, MemoryStore, Session, SessionManagerLayer};
 use tracing::error;
 
 #[derive(thiserror::Error, Debug)]
@@ -303,6 +303,12 @@ async fn post_register(
     Ok(Redirect::new("/").into_response())
 }
 
+async fn get_logout(session: Session) -> Result<Response> {
+    session.delete().await?;
+    session.set_expiry(Some(Expiry::OnInactivity(Duration::seconds(-1))));
+    Ok(Redirect::new("/").into_response())
+}
+
 fn build_mysql_options() -> sqlx::mysql::MySqlConnectOptions {
     let mut options = sqlx::mysql::MySqlConnectOptions::new()
         .host("localhost")
@@ -363,6 +369,7 @@ async fn main() {
         .route("/login", axum::routing::post(post_login))
         .route("/register", axum::routing::get(get_register))
         .route("/register", axum::routing::post(post_register))
+        .route("/logout", axum::routing::get(get_logout))
         .with_state(AppState { pool })
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(session_layer)
