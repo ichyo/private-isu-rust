@@ -5,6 +5,7 @@ use axum::{
     Form, Router,
 };
 use rand::prelude::*;
+use regex::Regex;
 use serde::Serialize;
 use shell_quote::Sh;
 use sqlx::MySqlConnection;
@@ -116,6 +117,15 @@ async fn try_login(
             None
         },
     )
+}
+
+fn validate_user(account_name: &str, password: &str) -> bool {
+    Regex::new(r"\A[0-9a-zA-Z_]{3,}\z")
+        .unwrap()
+        .is_match(account_name)
+        && Regex::new(r"\A[0-9a-zA-Z_]{6,}\z")
+            .unwrap()
+            .is_match(password)
 }
 
 fn secure_random_str(b: usize) -> String {
@@ -243,6 +253,56 @@ async fn get_register(
     .into_response())
 }
 
+async fn post_register(
+    session: Session,
+    State(AppState { pool, .. }): State<AppState>,
+    Form(form): Form<HashMap<String, String>>,
+) -> Result<Response> {
+    let mut conn = pool.acquire().await?;
+    if is_login(&get_session_user(&session, &mut conn).await?) {
+        return Ok(Redirect::new("/").into_response());
+    }
+
+    let account_name = form["account_name"].as_str();
+    let password = form["password"].as_str();
+
+    let validated = validate_user(account_name, password);
+    if !validated {
+        session
+            .insert(
+                "notice",
+                "アカウント名は3文字以上、パスワードは6文字以上である必要があります",
+            )
+            .await?;
+        return Ok(Redirect::new("/register").into_response());
+    }
+
+    let exists: Option<u8> = sqlx::query_scalar("SELECT 1 FROM users WHERE `account_name` = ?")
+        .bind(account_name)
+        .fetch_optional(&mut *conn)
+        .await?;
+
+    if let Some(_) = exists {
+        session
+            .insert("notice", "アカウント名がすでに使われています")
+            .await?;
+        return Ok(Redirect::new("/register").into_response());
+    }
+
+    let query = "INSERT INTO `users` (`account_name`, `passhash`) VALUES (?,?)";
+    let result = sqlx::query(query)
+        .bind(account_name)
+        .bind(calculate_passhash(account_name, password))
+        .execute(&mut *conn)
+        .await?;
+
+    let uid = result.last_insert_id();
+    session.insert("user_id", uid).await?;
+    session.insert("csrf_token", secure_random_str(16)).await?;
+
+    Ok(Redirect::new("/").into_response())
+}
+
 fn build_mysql_options() -> sqlx::mysql::MySqlConnectOptions {
     let mut options = sqlx::mysql::MySqlConnectOptions::new()
         .host("localhost")
@@ -302,6 +362,7 @@ async fn main() {
         .route("/login", axum::routing::get(get_login))
         .route("/login", axum::routing::post(post_login))
         .route("/register", axum::routing::get(get_register))
+        .route("/register", axum::routing::post(post_register))
         .with_state(AppState { pool })
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(session_layer)
