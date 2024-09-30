@@ -227,6 +227,22 @@ async fn post_login(
     }
 }
 
+async fn get_register(
+    session: Session,
+    State(AppState { pool, .. }): State<AppState>,
+) -> Result<Response> {
+    let mut conn = pool.acquire().await?;
+    if is_login(&get_session_user(&session, &mut conn).await?) {
+        return Ok(Redirect::new("/").into_response());
+    }
+
+    Ok(render_template(
+        "register.html",
+        minijinja::context!(flash => get_flash(&session, "notice").await?),
+    )?
+    .into_response())
+}
+
 fn build_mysql_options() -> sqlx::mysql::MySqlConnectOptions {
     let mut options = sqlx::mysql::MySqlConnectOptions::new()
         .host("localhost")
@@ -285,6 +301,7 @@ async fn main() {
         .route("/initialize", axum::routing::get(get_initialize))
         .route("/login", axum::routing::get(get_login))
         .route("/login", axum::routing::post(post_login))
+        .route("/register", axum::routing::get(get_register))
         .with_state(AppState { pool })
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(session_layer)
