@@ -277,7 +277,7 @@ async fn main() {
         .expect("failed to connect db");
 
     let session_store = MemoryStore::default();
-    let session_layer = SessionManagerLayer::new(session_store);
+    let session_layer = SessionManagerLayer::new(session_store).with_secure(false);
 
     let serve_dir = ServeDir::new("public");
 
