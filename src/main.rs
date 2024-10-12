@@ -688,6 +688,72 @@ async fn post_comment(
     Ok(Redirect::new(&format!("/posts/{}", post_id)).into_response())
 }
 
+async fn get_admin_banned(
+    session: Session,
+    State(AppState { pool, .. }): State<AppState>,
+) -> Result<Response> {
+    let mut conn = pool.acquire().await?;
+    let me = get_session_user(&session, &mut *conn).await?;
+    if !is_login(&me) {
+        return Ok(Redirect::new("/").into_response());
+    }
+    let me = me.unwrap();
+
+    if me.authority == 0 {
+        return Ok(StatusCode::FORBIDDEN.into_response());
+    }
+
+    let users: Vec<User> = sqlx::query_as(
+        "SELECT * FROM users WHERE `authority` = 0 AND `del_flg` = 0 ORDER BY `created_at` DESC",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+
+    Ok(render_template(
+        "banned.html",
+        minijinja::context!(me, users, csrf_token => get_csrf_token(&session).await),
+    )?
+    .into_response())
+}
+
+#[derive(Deserialize)]
+struct PostAdminBanned {
+    csrf_token: String,
+    #[serde(default, rename = "uid[]")]
+    uids: Vec<String>,
+}
+async fn post_admin_banned(
+    session: Session,
+    State(AppState { pool, .. }): State<AppState>,
+    axum_extra::extract::Form(form): axum_extra::extract::Form<PostAdminBanned>,
+) -> Result<Response> {
+    let mut conn = pool.acquire().await?;
+    let me = get_session_user(&session, &mut *conn).await?;
+    if !is_login(&me) {
+        return Ok(Redirect::new("/").into_response());
+    }
+    let me = me.unwrap();
+
+    if me.authority == 0 {
+        return Ok(StatusCode::FORBIDDEN.into_response());
+    }
+
+    if form.csrf_token != get_csrf_token(&session).await {
+        return Ok(StatusCode::UNPROCESSABLE_ENTITY.into_response());
+    }
+
+    let query = "UPDATE `users` SET `del_flg` = ? WHERE `id` = ?";
+    for uid in form.uids.iter() {
+        sqlx::query(query)
+            .bind(1)
+            .bind(uid)
+            .execute(&mut *conn)
+            .await?;
+    }
+
+    Ok(Redirect::new("/admin/banned").into_response())
+}
+
 fn build_mysql_options() -> sqlx::mysql::MySqlConnectOptions {
     let mut options = sqlx::mysql::MySqlConnectOptions::new()
         .host("localhost")
@@ -755,6 +821,8 @@ async fn main() {
         .route("/", axum::routing::post(post_index))
         .route("/image/:name", axum::routing::get(get_image))
         .route("/comment", axum::routing::post(post_comment))
+        .route("/admin/banned", axum::routing::get(get_admin_banned))
+        .route("/admin/banned", axum::routing::post(post_admin_banned))
         .route("/:account_name", axum::routing::get(get_account_name))
         .with_state(AppState { pool })
         .layer(tower_http::trace::TraceLayer::new_for_http())

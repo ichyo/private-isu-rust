@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = { version = "1.0", features = ["backtrace"] }
 axum = { version = "0.7", features = ["multipart"] }
+axum-extra = { version = "0.9.4", features = ["form"] }
 chrono = { version = "0.4", features = ["serde"] }
 minijinja = { version = "2.3.1", features = ["loader", "urlencode"] }
 rand = "0.8.5"
