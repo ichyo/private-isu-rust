@@ -439,11 +439,6 @@ async fn get_account_name(
     Path(account_name): Path<String>,
     State(AppState { pool, .. }): State<AppState>,
 ) -> Result<Response> {
-    if !account_name.starts_with("@") {
-        return Ok(StatusCode::NOT_FOUND.into_response());
-    }
-    let account_name = &account_name[1..];
-
     let mut conn = pool.acquire().await?;
     let user =
         sqlx::query_as::<_, User>("SELECT * FROM users WHERE account_name = ? AND `del_flg` = 0")
@@ -637,6 +632,9 @@ async fn get_image(
 ) -> Result<Response> {
     let mut conn = pool.acquire().await?;
     let parts = name.split('.').collect::<Vec<_>>();
+    if parts.len() != 2 {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    }
     let id = match parts[0].parse::<i64>() {
         Ok(id) => id,
         Err(_) => return Ok(StatusCode::NOT_FOUND.into_response()),
@@ -823,7 +821,7 @@ async fn main() {
         .route("/comment", axum::routing::post(post_comment))
         .route("/admin/banned", axum::routing::get(get_admin_banned))
         .route("/admin/banned", axum::routing::post(post_admin_banned))
-        .route("/:account_name", axum::routing::get(get_account_name))
+        .route("/@:account_name", axum::routing::get(get_account_name))
         .with_state(AppState { pool })
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(session_layer)
