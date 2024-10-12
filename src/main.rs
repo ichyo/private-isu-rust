@@ -1,6 +1,6 @@
 use axum::{
     extract::{Multipart, Path, Query, Request, State},
-    http::{HeaderValue, StatusCode},
+    http::{header, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Response},
     Form, Router,
 };
@@ -631,6 +631,33 @@ async fn post_index(
     return Ok(Redirect::new(&format!("/posts/{}", pid)).into_response());
 }
 
+async fn get_image(
+    Path(name): Path<String>,
+    State(AppState { pool, .. }): State<AppState>,
+) -> Result<Response> {
+    let mut conn = pool.acquire().await?;
+    let parts = name.split('.').collect::<Vec<_>>();
+    let id = match parts[0].parse::<i64>() {
+        Ok(id) => id,
+        Err(_) => return Ok(StatusCode::NOT_FOUND.into_response()),
+    };
+    let ext = parts[1];
+
+    let post: Post = sqlx::query_as("SELECT * FROM posts WHERE `id` = ?")
+        .bind(id)
+        .fetch_one(&mut *conn)
+        .await?;
+
+    if ext == "jpg" && post.mime == "image/jpeg"
+        || ext == "png" && post.mime == "image/png"
+        || ext == "gif" && post.mime == "image/gif"
+    {
+        return Ok(([(header::CONTENT_TYPE, &post.mime)], post.imgdata).into_response());
+    } else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    }
+}
+
 fn build_mysql_options() -> sqlx::mysql::MySqlConnectOptions {
     let mut options = sqlx::mysql::MySqlConnectOptions::new()
         .host("localhost")
@@ -696,6 +723,7 @@ async fn main() {
         .route("/posts", axum::routing::get(get_posts))
         .route("/posts/:id", axum::routing::get(get_posts_id))
         .route("/", axum::routing::post(post_index))
+        .route("/image/:name", axum::routing::get(get_image))
         .route("/:account_name", axum::routing::get(get_account_name))
         .with_state(AppState { pool })
         .layer(tower_http::trace::TraceLayer::new_for_http())
