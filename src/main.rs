@@ -4,9 +4,10 @@ use axum::{
     response::{Html, IntoResponse, Response},
     Form, Router,
 };
+use minijinja::value::ViaDeserialize;
 use rand::prelude::*;
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use shell_quote::Sh;
 use sqlx::MySqlConnection;
 use std::{collections::HashMap, env, process::Command};
@@ -27,7 +28,7 @@ impl axum::response::IntoResponse for Error {
         match self.0.downcast::<AppError>() {
             Ok(e) => e.into_response(),
             Err(e) => {
-                error!("{} {}", e, e.backtrace());
+                error!("Error: {:?}", e);
                 (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)).into_response()
             }
         }
@@ -58,14 +59,9 @@ impl IntoResponse for Redirect {
     }
 }
 
-fn render_template<S: Serialize>(tmpl_name: &str, context: S) -> Result<Html<String>> {
-    let mut env = minijinja::Environment::new();
-    env.set_loader(minijinja::path_loader("templates"));
-    let tmpl = env.get_template(tmpl_name)?;
-    Ok(Html(tmpl.render(context)?))
-}
+const POSTS_PER_PAGE: usize = 20;
 
-#[derive(sqlx::FromRow, Serialize)]
+#[derive(sqlx::FromRow, Serialize, Deserialize, Debug, Clone, Default)]
 struct User {
     id: i64,
     account_name: String,
@@ -75,23 +71,50 @@ struct User {
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
-fn is_login(user: &Option<User>) -> bool {
-    user.is_some()
+#[derive(sqlx::FromRow, Serialize, Deserialize, Debug, Clone, Default)]
+struct Post {
+    id: i64,
+    user_id: i64,
+    #[sqlx(default)]
+    imgdata: Vec<u8>,
+    body: String,
+    mime: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    #[sqlx(skip)]
+    comment_count: i64,
+    #[sqlx(skip)]
+    comments: Vec<Comment>,
+    #[sqlx(skip)]
+    user: User,
+    #[sqlx(skip)]
+    csrf_token: String,
 }
 
-async fn get_session_user(session: &Session, tx: &mut MySqlConnection) -> Result<Option<User>> {
-    let uid = session.get::<i64>("user_id").await?;
+#[derive(sqlx::FromRow, Serialize, Deserialize, Debug, Clone, Default)]
+struct Comment {
+    id: i64,
+    post_id: i64,
+    user_id: i64,
+    comment: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    #[sqlx(skip)]
+    user: User,
+}
 
-    if let Some(uid) = uid {
-        let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
-            .bind(uid)
-            .fetch_one(&mut *tx)
-            .await?;
+async fn db_initialize(tx: &mut MySqlConnection) -> Result<()> {
+    let sqls = [
+        "DELETE FROM users WHERE id > 1000",
+        "DELETE FROM posts WHERE id > 10000",
+        "DELETE FROM comments WHERE id > 100000",
+        "UPDATE users SET del_flg = 0",
+        "UPDATE users SET del_flg = 1 WHERE id % 50 = 0",
+    ];
 
-        Ok(Some(user))
-    } else {
-        Ok(None)
+    for sql in sqls.iter() {
+        sqlx::query(sql).execute(&mut *tx).await?;
     }
+
+    Ok(())
 }
 
 async fn try_login(
@@ -128,16 +151,6 @@ fn validate_user(account_name: &str, password: &str) -> bool {
             .is_match(password)
 }
 
-fn secure_random_str(b: usize) -> String {
-    let mut bytes = vec![0; b];
-    thread_rng().fill_bytes(&mut bytes);
-    bytes
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect::<Vec<_>>()
-        .join("")
-}
-
 fn digest(src: &str) -> String {
     let output = Command::new("sh")
         .arg("-c")
@@ -159,6 +172,21 @@ fn calculate_passhash(account_name: &str, password: &str) -> String {
     digest(&(password.to_string() + ":" + &calculate_salt(account_name)))
 }
 
+async fn get_session_user(session: &Session, tx: &mut MySqlConnection) -> Result<Option<User>> {
+    let uid = session.get::<i64>("user_id").await?;
+
+    if let Some(uid) = uid {
+        let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
+            .bind(uid)
+            .fetch_one(&mut *tx)
+            .await?;
+
+        Ok(Some(user))
+    } else {
+        Ok(None)
+    }
+}
+
 async fn get_flash(session: &Session, key: &str) -> Result<String> {
     Ok(match session.get(key).await? {
         Some(value) => {
@@ -169,20 +197,96 @@ async fn get_flash(session: &Session, key: &str) -> Result<String> {
     })
 }
 
-async fn db_initialize(tx: &mut MySqlConnection) -> Result<()> {
-    let sqls = [
-        "DELETE FROM users WHERE id > 1000",
-        "DELETE FROM posts WHERE id > 10000",
-        "DELETE FROM comments WHERE id > 100000",
-        "UPDATE users SET del_flg = 0",
-        "UPDATE users SET del_flg = 1 WHERE id % 50 = 0",
-    ];
+async fn make_posts(
+    tx: &mut MySqlConnection,
+    results: &[Post],
+    csrf_token: String,
+    all_comments: bool,
+) -> Result<Vec<Post>> {
+    let mut posts = vec![];
+    for p in results {
+        let mut p = p.clone();
+        p.comment_count =
+            sqlx::query_scalar("SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?")
+                .bind(p.id)
+                .fetch_one(&mut *tx)
+                .await?;
 
-    for sql in sqls.iter() {
-        sqlx::query(sql).execute(&mut *tx).await?;
+        let mut query =
+            "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC".to_string();
+        if !all_comments {
+            query += " LIMIT 3";
+        }
+        let mut comments = sqlx::query_as::<_, Comment>(&query)
+            .bind(p.id)
+            .fetch_all(&mut *tx)
+            .await?;
+
+        for c in comments.iter_mut() {
+            c.user = sqlx::query_as::<_, User>("SELECT * FROM `users` WHERE `id` = ?")
+                .bind(c.user_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        }
+
+        comments.reverse();
+
+        p.comments = comments;
+
+        p.user = sqlx::query_as::<_, User>("SELECT * FROM `users` WHERE `id` = ?")
+            .bind(p.user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+        p.csrf_token = csrf_token.clone();
+
+        if p.user.del_flg == 0 {
+            posts.push(p);
+        }
+        if posts.len() >= POSTS_PER_PAGE {
+            break;
+        }
     }
+    Ok(posts)
+}
 
-    Ok(())
+fn image_url(p: ViaDeserialize<Post>) -> String {
+    let ext = match p.mime.as_str() {
+        "image/jpeg" => ".jpg",
+        "image/png" => ".png",
+        "image/gif" => ".gif",
+        _ => "",
+    };
+    format!("/image/{}{}", p.id, ext)
+}
+
+fn is_login(user: &Option<User>) -> bool {
+    user.is_some()
+}
+
+async fn get_csrf_token(session: &Session) -> String {
+    match session.get::<String>("csrf_token").await {
+        Ok(Some(token)) => token,
+        _ => "".to_string(),
+    }
+}
+
+fn secure_random_str(b: usize) -> String {
+    let mut bytes = vec![0; b];
+    thread_rng().fill_bytes(&mut bytes);
+    bytes
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn render_template<S: Serialize>(tmpl_name: &str, context: S) -> Result<Html<String>> {
+    let mut env = minijinja::Environment::new();
+    env.set_loader(minijinja::path_loader("templates"));
+    env.add_function("image_url", image_url);
+    let tmpl = env.get_template(tmpl_name)?;
+    Ok(Html(tmpl.render(context)?))
 }
 
 async fn get_initialize(State(AppState { pool, .. }): State<AppState>) -> Result<()> {
@@ -309,6 +413,26 @@ async fn get_logout(session: Session) -> Result<Response> {
     Ok(Redirect::new("/").into_response())
 }
 
+async fn get_index(
+    session: Session,
+    State(AppState { pool, .. }): State<AppState>,
+) -> Result<Response> {
+    let mut conn = pool.acquire().await?;
+    let me = get_session_user(&session, &mut conn).await?;
+
+    let results = sqlx::query_as::<_, Post>(
+        "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM posts ORDER BY `created_at` DESC"
+    ).fetch_all(&mut *conn).await?;
+
+    let posts = make_posts(&mut conn, &results, get_csrf_token(&session).await, false).await?;
+
+    Ok(render_template(
+        "index.html",
+        minijinja::context!(me, posts, csrf_token => get_csrf_token(&session).await, flash => get_flash(&session, "notice").await?),
+    )?
+    .into_response())
+}
+
 fn build_mysql_options() -> sqlx::mysql::MySqlConnectOptions {
     let mut options = sqlx::mysql::MySqlConnectOptions::new()
         .host("localhost")
@@ -370,6 +494,7 @@ async fn main() {
         .route("/register", axum::routing::get(get_register))
         .route("/register", axum::routing::post(post_register))
         .route("/logout", axum::routing::get(get_logout))
+        .route("/", axum::routing::get(get_index))
         .with_state(AppState { pool })
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(session_layer)
