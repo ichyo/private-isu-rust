@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderValue, StatusCode},
     response::{Html, IntoResponse, Response},
     Form, Router,
@@ -500,6 +500,30 @@ async fn get_account_name(
     .into_response())
 }
 
+#[derive(Deserialize)]
+struct GetPostsParams {
+    max_created_at: chrono::DateTime<chrono::Utc>,
+}
+
+async fn get_posts(
+    session: Session,
+    State(AppState { pool, .. }): State<AppState>,
+    Query(params): Query<GetPostsParams>,
+) -> Result<Response> {
+    let mut conn = pool.acquire().await?;
+    let results = sqlx::query_as::<_, Post>(
+        "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM posts WHERE `created_at` <= ? ORDER BY `created_at` DESC"
+    ).bind(params.max_created_at).fetch_all(&mut *conn).await?;
+
+    let posts = make_posts(&mut conn, &results, get_csrf_token(&session).await, false).await?;
+
+    if posts.is_empty() {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    }
+
+    Ok(render_template("posts.html", minijinja::context!(posts)).into_response())
+}
+
 fn build_mysql_options() -> sqlx::mysql::MySqlConnectOptions {
     let mut options = sqlx::mysql::MySqlConnectOptions::new()
         .host("localhost")
@@ -562,6 +586,7 @@ async fn main() {
         .route("/register", axum::routing::post(post_register))
         .route("/logout", axum::routing::get(get_logout))
         .route("/", axum::routing::get(get_index))
+        .route("/posts", axum::routing::get(get_posts))
         .route("/:account_name", axum::routing::get(get_account_name))
         .with_state(AppState { pool })
         .layer(tower_http::trace::TraceLayer::new_for_http())
