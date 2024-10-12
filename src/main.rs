@@ -658,6 +658,36 @@ async fn get_image(
     }
 }
 
+async fn post_comment(
+    session: Session,
+    State(AppState { pool, .. }): State<AppState>,
+    Form(form): Form<HashMap<String, String>>,
+) -> Result<Response> {
+    let mut conn = pool.acquire().await?;
+    let me = get_session_user(&session, &mut *conn).await?;
+
+    if !is_login(&me) {
+        return Ok(Redirect::new("/login").into_response());
+    }
+    let me = me.unwrap();
+
+    if form["csrf_token"] != get_csrf_token(&session).await {
+        return Ok(StatusCode::UNPROCESSABLE_ENTITY.into_response());
+    }
+
+    let post_id = form["post_id"].parse::<i64>()?;
+
+    let query = "INSERT INTO `comments` (`post_id`, `user_id`, `comment`) VALUES (?,?,?)";
+    sqlx::query(query)
+        .bind(post_id)
+        .bind(me.id)
+        .bind(&form["comment"])
+        .execute(&mut *conn)
+        .await?;
+
+    Ok(Redirect::new(&format!("/posts/{}", post_id)).into_response())
+}
+
 fn build_mysql_options() -> sqlx::mysql::MySqlConnectOptions {
     let mut options = sqlx::mysql::MySqlConnectOptions::new()
         .host("localhost")
@@ -724,6 +754,7 @@ async fn main() {
         .route("/posts/:id", axum::routing::get(get_posts_id))
         .route("/", axum::routing::post(post_index))
         .route("/image/:name", axum::routing::get(get_image))
+        .route("/comment", axum::routing::post(post_comment))
         .route("/:account_name", axum::routing::get(get_account_name))
         .with_state(AppState { pool })
         .layer(tower_http::trace::TraceLayer::new_for_http())
