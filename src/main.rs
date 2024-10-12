@@ -15,16 +15,16 @@ use tower_sessions::{cookie::time::Duration, Expiry, MemoryStore, Session, Sessi
 use tracing::error;
 
 #[derive(thiserror::Error, Debug)]
-enum CustomError {}
-impl axum::response::IntoResponse for CustomError {
+enum AppError {}
+impl axum::response::IntoResponse for AppError {
     fn into_response(self) -> Response {
         match self {}
     }
 }
 
-impl axum::response::IntoResponse for AppError {
+impl axum::response::IntoResponse for Error {
     fn into_response(self) -> Response {
-        match self.0.downcast::<CustomError>() {
+        match self.0.downcast::<AppError>() {
             Ok(e) => e.into_response(),
             Err(e) => {
                 error!("{} {}", e, e.backtrace());
@@ -35,15 +35,15 @@ impl axum::response::IntoResponse for AppError {
 }
 
 #[derive(Debug)]
-struct AppError(anyhow::Error);
+struct Error(anyhow::Error);
 
-impl<E: Into<anyhow::Error>> From<E> for AppError {
+impl<E: Into<anyhow::Error>> From<E> for Error {
     fn from(e: E) -> Self {
         Self(e.into())
     }
 }
 
-type Result<T, E = AppError> = std::result::Result<T, E>;
+type Result<T, E = Error> = std::result::Result<T, E>;
 
 // axum::response::Redirect doesn't support 302 status code.
 struct Redirect(HeaderValue);
