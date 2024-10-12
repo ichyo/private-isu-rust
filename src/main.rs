@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Multipart, Path, Query, Request, State},
     http::{HeaderValue, StatusCode},
     response::{Html, IntoResponse, Response},
     Form, Router,
@@ -13,7 +13,7 @@ use sqlx::MySqlConnection;
 use std::{collections::HashMap, env, process::Command};
 use tower_http::services::ServeDir;
 use tower_sessions::{cookie::time::Duration, Expiry, MemoryStore, Session, SessionManagerLayer};
-use tracing::error;
+use tracing::{error, field, info};
 
 #[derive(thiserror::Error, Debug)]
 enum AppError {}
@@ -60,6 +60,7 @@ impl IntoResponse for Redirect {
 }
 
 const POSTS_PER_PAGE: usize = 20;
+const UPLOAD_LIMIT: usize = 10 * 1024 * 1024; // 10mb
 
 #[derive(sqlx::FromRow, Serialize, Deserialize, Debug, Clone, Default)]
 struct User {
@@ -549,6 +550,87 @@ async fn get_posts_id(
     Ok(render_template("post.html", minijinja::context!(me, post => p)).into_response())
 }
 
+async fn post_index(
+    session: Session,
+    State(AppState { pool, .. }): State<AppState>,
+    mut multipart: Multipart,
+) -> Result<Response> {
+    let mut conn = pool.acquire().await?;
+    let me = get_session_user(&session, &mut *conn).await?;
+
+    if !is_login(&me) {
+        return Ok(Redirect::new("/login").into_response());
+    }
+
+    let mut fields = HashMap::new();
+
+    #[derive(Debug, Default)]
+    struct Field {
+        filename: String,
+        content_type: String,
+        data: Vec<u8>,
+    }
+
+    while let Some(mut field) = multipart.next_field().await? {
+        let name = field.name().map(|s| s.to_string());
+        if let Some(name) = name {
+            let mut value = Field::default();
+            if let Some(filename) = field.file_name() {
+                value.filename = filename.to_string();
+            }
+            if let Some(content_type) = field.content_type() {
+                value.content_type = content_type.to_string();
+            }
+            value.data = field.bytes().await?.to_vec();
+            fields.insert(name.to_string(), value);
+        }
+    }
+
+    if fields["csrf_token"].data != get_csrf_token(&session).await.as_bytes() {
+        return Ok(StatusCode::UNPROCESSABLE_ENTITY.into_response());
+    }
+
+    if !fields.contains_key("file") {
+        session.insert("notice", "画像が必要です").await?;
+        return Ok(Redirect::new("/").into_response());
+    }
+
+    let content_type = &fields["file"].content_type;
+    let mime = if content_type.contains("jpeg") {
+        "image/jpeg"
+    } else if content_type.contains("png") {
+        "image/png"
+    } else if content_type.contains("gif") {
+        "image/gif"
+    } else {
+        session
+            .insert("notice", "投稿できる画像形式はjpgとpngとgifだけです")
+            .await?;
+        return Ok(Redirect::new("/").into_response());
+    };
+
+    if fields["file"].data.len() > UPLOAD_LIMIT {
+        session
+            .insert("notice", "ファイルサイズが大きすぎます")
+            .await?;
+        return Ok(Redirect::new("/").into_response());
+    }
+
+    let query = "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)";
+
+    let result = sqlx::query(query)
+        .bind(me.as_ref().unwrap().id)
+        .bind(mime)
+        .bind(&fields["file"].data)
+        .bind(&fields["body"].data)
+        .execute(&mut *conn)
+        .await?;
+
+    let pid = result.last_insert_id();
+
+    return Ok(Redirect::new(&format!("/posts/{}", pid)).into_response());
+}
+
 fn build_mysql_options() -> sqlx::mysql::MySqlConnectOptions {
     let mut options = sqlx::mysql::MySqlConnectOptions::new()
         .host("localhost")
@@ -613,6 +695,7 @@ async fn main() {
         .route("/", axum::routing::get(get_index))
         .route("/posts", axum::routing::get(get_posts))
         .route("/posts/:id", axum::routing::get(get_posts_id))
+        .route("/", axum::routing::post(post_index))
         .route("/:account_name", axum::routing::get(get_account_name))
         .with_state(AppState { pool })
         .layer(tower_http::trace::TraceLayer::new_for_http())
