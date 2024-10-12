@@ -524,6 +524,31 @@ async fn get_posts(
     Ok(render_template("posts.html", minijinja::context!(posts)).into_response())
 }
 
+async fn get_posts_id(
+    session: Session,
+    Path(id): Path<i64>,
+    State(AppState { pool, .. }): State<AppState>,
+) -> Result<Response> {
+    let mut conn = pool.acquire().await?;
+
+    let resuls = sqlx::query_as::<_, Post>("SELECT * FROM posts WHERE `id` = ?")
+        .bind(id)
+        .fetch_all(&mut *conn)
+        .await?;
+
+    let posts = make_posts(&mut conn, &resuls, get_csrf_token(&session).await, true).await?;
+
+    if posts.is_empty() {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    }
+
+    let p = &posts[0];
+
+    let me = get_session_user(&session, &mut conn).await?;
+
+    Ok(render_template("post.html", minijinja::context!(me, post => p)).into_response())
+}
+
 fn build_mysql_options() -> sqlx::mysql::MySqlConnectOptions {
     let mut options = sqlx::mysql::MySqlConnectOptions::new()
         .host("localhost")
@@ -587,6 +612,7 @@ async fn main() {
         .route("/logout", axum::routing::get(get_logout))
         .route("/", axum::routing::get(get_index))
         .route("/posts", axum::routing::get(get_posts))
+        .route("/posts/:id", axum::routing::get(get_posts_id))
         .route("/:account_name", axum::routing::get(get_account_name))
         .with_state(AppState { pool })
         .layer(tower_http::trace::TraceLayer::new_for_http())
