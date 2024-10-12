@@ -1,0 +1,20 @@
+[Unit]
+Description=isu-rust
+After=syslog.target
+After=mysql.service
+Requires=mysql.service
+
+[Service]
+WorkingDirectory=/home/isucon/private_isu/webapp/rust
+EnvironmentFile=/home/isucon/env.sh
+
+User=isucon
+Group=isucon
+ExecStart=/home/isucon/private_isu/webapp/rust/target/release/isuconp
+ExecStop=/bin/kill -s QUIT $MAINPID
+
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
