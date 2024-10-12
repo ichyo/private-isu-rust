@@ -1,5 +1,5 @@
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{HeaderValue, StatusCode},
     response::{Html, IntoResponse, Response},
     Form, Router,
@@ -433,6 +433,73 @@ async fn get_index(
     .into_response())
 }
 
+async fn get_account_name(
+    session: Session,
+    Path(account_name): Path<String>,
+    State(AppState { pool, .. }): State<AppState>,
+) -> Result<Response> {
+    if !account_name.starts_with("@") {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    }
+    let account_name = &account_name[1..];
+
+    let mut conn = pool.acquire().await?;
+    let user =
+        sqlx::query_as::<_, User>("SELECT * FROM users WHERE account_name = ? AND `del_flg` = 0")
+            .bind(account_name)
+            .fetch_optional(&mut *conn)
+            .await?;
+
+    let user = match user {
+        Some(user) => user,
+        None => return Ok(StatusCode::NOT_FOUND.into_response()),
+    };
+
+    let results = sqlx::query_as::<_, Post>(
+        "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM posts WHERE `user_id` = ? ORDER BY `created_at` DESC"
+    ).bind(user.id).fetch_all(&mut *conn).await?;
+
+    let posts = make_posts(&mut conn, &results, get_csrf_token(&session).await, true).await?;
+
+    let comment_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) AS `count` FROM `comments` WHERE `user_id` = ?")
+            .bind(user.id)
+            .fetch_one(&mut *conn)
+            .await?;
+
+    let post_ids: Vec<i64> = sqlx::query_scalar("SELECT `id` FROM `posts` WHERE `user_id` = ?")
+        .bind(user.id)
+        .fetch_all(&mut *conn)
+        .await?;
+    let post_count = post_ids.len();
+
+    let mut commented_count = 0;
+    if post_count > 0 {
+        let placeholder = (0..post_count).map(|_| "?").collect::<Vec<_>>().join(", ");
+
+        let query = format!(
+            "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` IN ({})",
+            placeholder
+        );
+
+        let mut query = sqlx::query_scalar(&query);
+
+        for id in post_ids.iter() {
+            query = query.bind(id);
+        }
+
+        commented_count = query.fetch_one(&mut *conn).await?;
+    }
+
+    let me = get_session_user(&session, &mut conn).await?;
+
+    Ok(render_template(
+        "user.html",
+        minijinja::context!(user, posts, post_count, comment_count, commented_count, me),
+    )
+    .into_response())
+}
+
 fn build_mysql_options() -> sqlx::mysql::MySqlConnectOptions {
     let mut options = sqlx::mysql::MySqlConnectOptions::new()
         .host("localhost")
@@ -495,6 +562,7 @@ async fn main() {
         .route("/register", axum::routing::post(post_register))
         .route("/logout", axum::routing::get(get_logout))
         .route("/", axum::routing::get(get_index))
+        .route("/:account_name", axum::routing::get(get_account_name))
         .with_state(AppState { pool })
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(session_layer)
