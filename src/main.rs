@@ -805,7 +805,7 @@ async fn main() {
 
     let memcache_addr =
         env::var("ISUCONP_MEMCACHED_ADDRESS").unwrap_or("localhost:11211".to_string());
-    let memcache = memcache::Client::connect(memcache_addr).unwrap();
+    let memcache = memcache::Client::connect(format!("memcache://{}", memcache_addr)).unwrap();
 
     let session_store = store::MemcachedStore::new(memcache);
     let session_layer = SessionManagerLayer::new(session_store).with_secure(false);
