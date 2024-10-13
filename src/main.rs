@@ -12,7 +12,7 @@ use shell_quote::Sh;
 use sqlx::MySqlConnection;
 use std::{collections::HashMap, env, process::Command};
 use tower_http::services::ServeDir;
-use tower_sessions::{cookie::time::Duration, Expiry, MemoryStore, Session, SessionManagerLayer};
+use tower_sessions::{cookie::time::Duration, Expiry, Session, SessionManagerLayer};
 use tracing::error;
 
 mod store;
@@ -568,7 +568,7 @@ async fn post_index(
         data: Vec<u8>,
     }
 
-    while let Some(mut field) = multipart.next_field().await? {
+    while let Some(field) = multipart.next_field().await? {
         let name = field.name().map(|s| s.to_string());
         if let Some(name) = name {
             let mut value = Field::default();
