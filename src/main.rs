@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Multipart, Path, Query, Request, State},
+    extract::{Multipart, Path, Query, State},
     http::{header, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Response},
     Form, Router,
@@ -13,7 +13,9 @@ use sqlx::MySqlConnection;
 use std::{collections::HashMap, env, process::Command};
 use tower_http::services::ServeDir;
 use tower_sessions::{cookie::time::Duration, Expiry, MemoryStore, Session, SessionManagerLayer};
-use tracing::{error, field, info};
+use tracing::error;
+
+mod store;
 
 #[derive(thiserror::Error, Debug)]
 enum AppError {}
@@ -801,7 +803,11 @@ async fn main() {
         .await
         .expect("failed to connect db");
 
-    let session_store = MemoryStore::default();
+    let memcache_addr =
+        env::var("ISUCONP_MEMCACHED_ADDRESS").unwrap_or("localhost:11211".to_string());
+    let memcache = memcache::Client::connect(memcache_addr).unwrap();
+
+    let session_store = store::MemcachedStore::new(memcache);
     let session_layer = SessionManagerLayer::new(session_store).with_secure(false);
 
     let serve_dir = ServeDir::new("public");
